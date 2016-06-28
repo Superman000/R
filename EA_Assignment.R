@@ -15,9 +15,8 @@ library(SOAR)
 library(doParallel)
 
 ea_assignment_loop <- function(a,shapes,shapeids,coordinates,output){
-  #Select the current shape - Indexed by EA_CODE
-  #PR_MDB_C
-  shapesubset <- subset(shapes, shapes$EA_CODE == shapeids[a,])
+  #Select the current shape - Indexed by Shape_Code
+  shapesubset <- subset(shapes, shapes$Shape_Code == shapeids[a,])
   
   temp = !is.na(over(coordinates, as(shapesubset, "SpatialPolygons")))
   
@@ -27,9 +26,7 @@ ea_assignment_loop <- function(a,shapes,shapeids,coordinates,output){
     
     temp <- temp + 0
     
-    temp$ConsumerID <- coordinates@data$ConsumerID
-    
-    temp$ConsumerGeoAddressID <- coordinates@data$ConsumerGeoAddressID
+    temp$ID <- coordinates@data$ID
     
     temp <- temp[temp$temp > 0,]
     
@@ -38,15 +35,15 @@ ea_assignment_loop <- function(a,shapes,shapeids,coordinates,output){
     
     temp$EA_CODE <- shapeids[a,]
     
-    data.frame(ConsumerID = temp$ConsumerID, ConsumerGeoAddressID = temp$ConsumerGeoAddressID, EA_CODE = temp$EA_CODE)
+    data.frame(ID = temp$ID, Shape_Code = temp$Shape_Code)
   }
 }
 
 #Read in shape files
-shapes <- readOGR("D:/GeoSpacial/Census 2011 Spatial Geography","EA_SA_2011")
+shapes <- readOGR("<shape files location>","<layer name>")
 
 #SQL connection
-myconn <-odbcConnect("SAS-Server",uid="sa",pwd="P@ssw0rd")
+myconn <-odbcConnect("<RODBC connection name>",uid="<uid>",pwd="<password>")
 
 #Output EA characteristics to SQL 
 #sqlSave(myconn, shapedataframe, tablename = "EASpecification", append = TRUE)
@@ -54,32 +51,32 @@ myconn <-odbcConnect("SAS-Server",uid="sa",pwd="P@ssw0rd")
 #Function to read in a part of the input data
 ea_assignment <- function(a,shapes){
   #Build query string
-  #Only select addresses that have non-missing coordinates
+  #Only select non-missing coordinates
+  #ID is a counter which runs from 1 to the number of rows in the table containing coordinates
   if(a < 2){
-    query <- paste("select ConsumerID, ConsumerGeoAddressID, X, Y from ConsumerGeoAddress..ConsumerGeoAddress where ConsumerGeoAddressID < ",a*1000000," and X != '0' and Y != '0'" ,sep="")
+    query <- paste("select X, Y from database..table where ID < ",a*1000000," and X != '0' and Y != '0'" ,sep="")
   }
   else{
-    query <- paste("select ConsumerID, ConsumerGeoAddressID, X, Y from ConsumerGeoAddress..ConsumerGeoAddress where ConsumerGeoAddressID < ",a*1000000, " and ConsumerGeoAddressID >= ", (a-1)*1000000," and X != '0' and Y != '0'",sep="")
+    query <- paste("select X, Y from database..table where ID < ",a*1000000, " and ID >= ", (a-1)*1000000," and X != '0' and Y != '0'",sep="")
   }
-  
   return (sqlQuery(myconn,query))
 }
 
 #Register multi-core backend
 registerDoParallel(detectCores())    
 
-#Drop EAAssignment table if it exists
-#sqlQuery(myconn, "IF OBJECT_ID('ConsumerGeoAddress..EAAssignment', 'U') IS NOT NULL
-         #DROP TABLE ConsumerGeoAddress..EAAssignment;")
+#Drop destination table if it exists
+#sqlQuery(myconn, "IF OBJECT_ID('database..table', 'U') IS NOT NULL
+         #DROP TABLE database..table;")
 
 #Get the total number of rows in the database
-parts <- sqlQuery(myconn, "select count(*) from ConsumerGeoAddress..ConsumerGeoAddress")
+parts <- sqlQuery(myconn, "select count(*) from database..table")
 
 #Determine how many runs, doing one million rows at a time, we will need to do
 numruns <- ceiling(parts/1000000)
 
 #for(a in 1:numruns[1,1]){
-for(a in 1:50){
+for(a in 1:numruns){
   start.time <- Sys.time()
   print(a)
   #Get the n-th million of the data
@@ -92,13 +89,10 @@ for(a in 1:50){
   proj4string(coordinates) <- proj4string(shapes)
   
   #Assign a coordinate to a specific shape 
-  #This will be used to associate enumerated areas with actual coordinates
-  #The end-result is an enumerated area ID assigned to each coordinate
   shapedataframe <- as.data.frame(shapes)
   
   #Get list of shapeIDs
-  #EA_CODE refers to the enumerated area ID
-  shapeids <- as.data.frame(shapedataframe[,"EA_CODE"])
+  shapeids <- as.data.frame(shapedataframe[,"Shape_Code"])
   
   #Rename column
   names(shapeids)[1] <- "shapeid"
@@ -107,25 +101,21 @@ for(a in 1:50){
   output <- as.data.frame(matrix(0, ncol = 3, nrow = 0))
   
   #Rename column to ConsumerID
-  colnames(output)[1] <- c("ConsumerID")
+  colnames(output)[1] <- c("ID")
   
-  #Rename column to ConsumerID
-  colnames(output)[2] <- c("ConsumerGeoAddressID")
-  
-  #Rename column to EA_CODE
-  colnames(output)[3] <- c("EA_CODE")
+  #Rename column to Shape_Code
+  colnames(output)[2] <- c("Shape_Code")
   
   #Rename column to LastUpdatedDate
-  colnames(output)[4] <- c("LastUpdatedDate")
+  colnames(output)[3] <- c("LastUpdatedDate")
   
   #Loop through all shapeids and check whether a coordinate is in that shape
   output <- foreach(i=1:nrow(shapeids),.packages=c("plyr"),.combine='rbind') %dopar% { 
     ea_assignment_loop(i,shapes,shapeids,coordinates,output)
   }
   
-  #Output ConsumerID and EA_CODE pairs to a text file
-  #Replace Server_Path with a valid path
-  cat(output, file="Server_Path/EA_AssignmentTest.txt", append=TRUE, sep = ",")
+  #Output ID and Shape_Code pairs to a text file
+  cat(output, file="Path/output.txt", append=TRUE, sep = ",")
   
   #Garbage collection statement
   gc()
@@ -137,23 +127,8 @@ for(a in 1:50){
   time.taken <- as.data.frame(time.taken)
   
   #Output the time taken to a text file
-  cat(time.taken, file="D:/Geo XAC/EA assignment project/EAAssignmentTime.txt", append=TRUE, sep = ",")
+  cat(time.taken, file="Path/time_take.txt", append=TRUE, sep = ",")
 }
-
-#Copy output file to server
-#This path should be the same as the file which is appended at each iteration of the loop above
-#Replace Server_Path with a valid path
-file.copy("Server_Path/EA_AssignmentTest.txt","//sas-server/S$/Ruan/EA_Assignment",overwrite = TRUE)
-
-#Create new table
-sqlQuery(myconn,"create table Ruan..EAAssignmentTest (
-         ConsumerID varchar(255),
-         ConsumerGeoAddressID varchar(255),
-         EA_CODE varchar(255),
-		 LastUpdatedDate date)")
-
-#Bulk import file
-sqlQuery(myconn,"BULK INSERT Ruan..EAAssignmentTest FROM '\\\\sas-server\\S$\\Ruan\\EA_Assignment\\EA_AssignmentTest.txt' WITH (FIELDTERMINATOR = ',',ROWTERMINATOR = '\\n')")
 
 #Close database connection
 close(myconn)
