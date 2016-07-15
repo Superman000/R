@@ -7,17 +7,17 @@ RFM <- function(df,startDate,endDate,tIDColName="ID_COL_NAME",tDateColName="DATE
   df <- df[df[,tDateColName]<= endDate,]
   #remove the rows with the duplicated IDs, and assign the df to a new df.
   newdf <- df[!duplicated(df[,tIDColName]),]
-  # caculate the Recency(days) to the endDate, the smaller days value means more recent
+  #calculate the Recency(days) to the endDate, the smaller days value means more recent
   Recency<-as.numeric(difftime(endDate,newdf[,tDateColName],units="days"))
-  # add the Days column to the newdf data frame
+  #add the Days column to the newdf data frame
   newdf <-cbind(newdf,Recency)
   #order the dataframe by ID to fit the return order of table() and tapply()
   newdf <- newdf[order(newdf[,tIDColName]),]
-  # caculate the frequency
+  #calculate the frequency
   fre <- as.data.frame(table(df[,tIDColName]))
   Frequency <- fre[,2]
   newdf <- cbind(newdf,Frequency)
-  #caculate the Money per deal
+  #calculate the Money per deal
   m <- as.data.frame(tapply(df[,tAmountColName],df[,tIDColName],sum))
   Monetary <- m[,1]/Frequency
   newdf <- cbind(newdf,Monetary)
@@ -40,7 +40,7 @@ GetRFMScore <- function(df,r = 3,f = 3,m = 3) {
   df <- cbind(df, M_Score)
   #order the dataframe by R_Score, F_Score, and M_Score desc
   df <- df[order(-df$R_Score,-df$F_Score,-df$M_Score),]
-  # caculate the total score
+  #calculate the total score
   Total_Score <- c(100*df$R_Score + 10*df$F_Score+df$M_Score)
   df <- cbind(df,Total_Score)
   return (df)
@@ -51,10 +51,10 @@ scoring <- function (df,column,r){
   #get the length of rows of df
   len <- dim(df)[1]
   score <- rep(0,times=len)
-  # get the quantity of rows per 1/r e.g. 1/5
+  #get the quantity of rows per 1/r e.g. 1/5
   nr <- round(len / r)
   if (nr > 0){
-    # seperate the rows by r aliquots
+    #seperate the rows by r aliquots
     rStart <-0
     rEnd <- 0
     for (i in 1:r){
@@ -67,9 +67,9 @@ scoring <- function (df,column,r){
       }else{
         rEnd <- i*nr
       }
-      # set the Recency score
+      #set the Recency score
       score[rStart:rEnd]<- r-i+1
-      # make sure the customer who have the same recency have the same score
+      #make sure the customer who have the same recency have the same score
       s <- rEnd+1
       if(i<r & s <= len){
         for(u in s: len){
