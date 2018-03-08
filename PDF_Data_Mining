@@ -1,0 +1,279 @@
+#Assign libraries
+library(tesseract)
+library(pdftools)
+library(doParallel)
+library(sqldf)
+
+#Start time
+start.time <- Sys.time()
+
+#First fix file names to not contain spaces - replace spaces with underscores
+#Specify a directory which contains the PDF files
+dir <- ""
+
+#Obtain a list of file names with a .pdf extension
+pdf_files <- list.files(dir,pattern = "\\.pdf$")
+
+#Fix file names
+for(i in 1:length(pdf_files)){
+  file.rename(paste(dir,pdf_files[i],sep="/"),paste(dir,gsub(" ", "", pdf_files[i]),sep="/"))
+}
+
+#Create PNG images from PDF documents
+pdf_files <- list.files(dir,pattern = "\\.pdf$")
+
+#Configure parallel exection
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+foreach(i=1:length(pdf_files), .packages='pdftools') %dopar% {
+  num_pages <- pdf_info(paste(dir,pdf_files[i],sep="/"))$pages
+  output_file_names <- character(num_pages)
+  #Build file names vector
+  for(a in 1:num_pages){
+    output_file_names[a] <- paste(paste(dir,"Images",sep="/"),gsub(".pdf",paste("_",a,".png",sep=""),pdf_files[i]),sep="/")
+  }
+  
+  pdf_convert(paste(dir,pdf_files[i],sep="/"),dpi=300,filenames=output_file_names)
+}
+
+#Create output OCR file
+text_output <- as.data.frame(matrix(0, ncol = 2, nrow = 0))
+colnames(text_output) <- c("FileName","OutputText")
+
+#Get list of images
+image_files <- list.files(paste(dir,"Images",sep="/"),pattern = "\\.png$")
+
+text_output <- foreach(i=1:length(image_files),.packages='tesseract',.combine=rbind) %dopar% {
+  engineOptions <- tesseract(options = list(preserve_interword_spaces = "1"))
+  data.frame(FileName=gsub(".png",".pdf",image_files[i]),OutputText=ocr(paste(dir,"Images",image_files[i],sep="/"),engine=engineOptions))
+}
+
+regex_func <- function(matchStr,inputStr){
+  regex_match <- regexpr(paste("[\\n\\r]*",matchStr,"\\s*([^\\n\\r]*)",sep=""),inputStr,perl=T)
+  regex_output <- substr(inputStr,attr(regex_match,"capture.start"),attr(regex_match,"capture.start")+attr(regex_match,"capture.length") - 1)
+  return (regex_output)
+}
+
+#Create output data frame in which the formatted text will be stored
+cleaned_pdf_text <- as.data.frame(matrix(0, ncol = 2, nrow = 0))
+colnames(cleaned_pdf_text) <- c("FileName","ChequeAccountNumber")
+
+#Create transaction output data frame
+txn_detail <- as.data.frame(matrix(0, ncol = 11, nrow = 0))
+colnames(txn_detail) <- c("FileNameParent","FileName",
+                          "DateStamp","TxnDescription","TxnDescriptionDetail","Charge"
+                          ,"ChargeCode","DebitCreditAmount","RunningBalance","BalanceDetail")
+
+#Remove empty lines from text_output
+text_output <- text_output[text_output$OutputText != "",]
+
+#Create dataframe storing first page-specific information
+first_page_info <- as.data.frame(matrix(0, ncol = 17, nrow = 0))
+colnames(first_page_info) <- c("FileNameParent","ChequeAccountNumber","DateRange",
+                               "AccountType","IssuedOn","StatementNumber",
+                               "ClientVatRegNumber","BalanceBroughtForward",
+                               "Deposits","InterestEarned","SundryCredits",
+                               "CashChequeAtmWithdrawals","SundryDebits",
+                               "Charges","ChequesDepositedUnpaid","Balance",
+                               "OverdraftLimit")
+
+#Extract data from text dump
+for(i in 1:nrow(text_output)){
+  #ACCOUNT NUMBER
+  #Get account number
+  cheque_acc_num <- regex_func("Cheque\\s+Account\\s+Number:",text_output$OutputText[i])
+  
+  #Remove spaces
+  cheque_acc_num <- gsub(" ","",cheque_acc_num)
+  
+  #DATE RANGE
+  date_range <- regex_func("Cheque\\s+account\\s+statement",text_output$OutputText[i])
+  date_range <- gsub("  "," ",date_range)
+  
+  #ACCOUNT TYPE
+  account_type <- regex_func("Account\\s+Type:",text_output$OutputText[i])
+  #Remove whitespace not needed
+  issued_on_start <- regexpr("Issued\\s+on:",account_type,perl=T)
+  issued_on_end <- regexpr("\\d{1,2}\\s+\\D{3}\\s+\\d{4}",account_type,perl=T)
+  issued_on <- substr(account_type,issued_on_end,issued_on_end + issued_on_start)
+  account_type <- substr(account_type,1,issued_on_start - 1)
+  account_type <- trimws(account_type, "r")
+  
+  #STATEMENT NO
+  statement_no <- regex_func("Statement\\s+no:",text_output$OutputText[i])
+  
+  #CLIENT VAT REG NO
+  client_vat_reg_no <- regex_func("Client VAT reg no:",text_output$OutputText[i])
+  
+  #Strip out account summary section
+  account_summary_start <- regexpr("Account\\s+Summary:",text_output$OutputText[i],perl=T)
+  account_summary_end <- regexpr("Your\\s+transactions",text_output$OutputText[i],perl=T)
+  account_summary <- substr(text_output$OutputText[i],account_summary_start,account_summary_end - 1)
+  
+  #BALANCE BROUGHT FORWARD
+  balance_brought_forward_start <- regexpr("(Balance\\s+Brou[a-z]\\s{0,1}ht\\s+Forward)",account_summary,perl=T)
+  balance_brought_forward_temp <- strsplit(gsub("(\\s{3,})","|",substr(account_summary,balance_brought_forward_start,nchar(account_summary))),"\\|")
+  balance_brought_forward <- strsplit(balance_brought_forward_temp[[1]][2],"\\n")[[1]][1]
+  
+  #DEPOSITS
+  deposits <- regex_func("Deposits",account_summary)
+  
+  #INTEREST EARNED
+  interest_earned <- regex_func("Interest\\sEarned",account_summary)
+  
+  #SUNDRY CREDITS
+  sundry_credits <- regex_func("Sundry\\sCredits",account_summary)
+  
+  #CASH CHEQUE AND ATM WITHDRAWALS
+  cash_cheque_atm_withdrawals <- regex_func("Cash,\\sCheque\\sand\\sATM\\sWithdrawals",account_summary)
+  
+  #SUNDRY DEBITS
+  sundry_debits <- regex_func("Sundry\\sDebits",account_summary)
+  
+  #CHARGES
+  charges <- regex_func("Charges",account_summary)
+  
+  #CHEQUES DEPOSITED UNPAID
+  cheques_deposited_unpaid <- regex_func("Cheques\\sDeposited\\sUnpaid",account_summary)
+  
+  #BALANCE
+  balance <- regex_func("Balance\\s{2}+",account_summary)
+  
+  #OVERDRAFT LIMIT
+  overdraft_limit <- regex_func("Overdraft\\sLimit",account_summary)
+  
+  #Strip out transactions section
+  transactions_start <- regexpr("Your\\stransactions",text_output$OutputText[i],perl=T)
+  transactions_end <- regexpr("Page\\s+\\d+\\s+of\\s{0,}\\d+",text_output$OutputText[i],perl=T)
+  transactions <- substr(text_output$OutputText[i],transactions_start,transactions_end - 1)
+  
+  #Split transactions into lines
+  trans_lines <- strsplit(transactions,"\n")
+  
+  #Remove empty entries from the list
+  trans_lines[[1]] <- trans_lines[[1]][trans_lines[[1]] != ""]
+  
+  #Build first page info data frame
+  first_page_info <- rbind(first_page_info,data.frame(FileNameParent=paste(strsplit(as.character(text_output$FileName[i]),"_")[[1]][1],".pdf",sep=""),
+                                                      ChequeAccountNumber=cheque_acc_num,DateRange=date_range,AccountType=account_type,
+                                                      IssuedOn=issued_on,StatementNumber=statement_no,ClientVatRegNumber=client_vat_reg_no,
+                                                      BalanceBroughtForward=balance_brought_forward,Deposits=deposits,InterestEarned=interest_earned,
+                                                      SundryCredits=sundry_credits,CashChequeAtmWithdrawals=cash_cheque_atm_withdrawals,
+                                                      SundryDebits=sundry_debits,Charges=charges,ChequesDepositedUnpaid=cheques_deposited_unpaid,
+                                                      Balance=balance,OverdraftLimit=overdraft_limit))
+  
+  #Loop through lines
+  for(a in 1:length(trans_lines[[1]])){
+    #Replace one or more space with double pipe
+    txn_temp <- gsub("(\\s{3,})","|",trans_lines[[1]][a])
+    
+    #Split temporary string by ||
+    txn_line_split <- as.list(strsplit(txn_temp, "\\|"))
+    
+    #Loop through splits
+    #Only loop if there is more than one split
+    #Also exclude the split which contains column names
+    if(txn_line_split[[1]][1] != "Your transactions" && txn_line_split[[1]][1] != "Date"){
+      #Identify and handle 'Bal Brought Forward' case
+      #CASE 1
+      #regexpr("(Bal\\sBrought\\sFo[a-z]{3,}rd)",txn_line_split[[1]][2],perl=T) > 0
+      if(!is.na(txn_line_split[[1]][2]) && length(txn_line_split[[1]]) == 3){
+        txn_detail <- rbind(txn_detail,data.frame(FileNameParent=paste(strsplit(as.character(text_output$FileName[i]),"_")[[1]][1],".pdf",sep=""),
+                                                  FileName=text_output$FileName[i],
+                                                  DateStamp=txn_line_split[[1]][1],
+                                                  TxnDescription=txn_line_split[[1]][2],
+                                                  TxnDescriptionDetail=NA,
+                                                  Charge=NA,
+                                                  ChargeCode=NA,
+                                                  DebitCreditAmount=NA,
+                                                  RunningBalance=txn_line_split[[1]][3],
+                                                  BalanceDetail=NA))
+      }
+      #Identify 'Bank Statement' charge case
+      #CASE 2
+      else if(!is.na(txn_line_split[[1]][2]) && length(txn_line_split[[1]]) == 6){
+        txn_detail <- rbind(txn_detail,data.frame(FileNameParent=paste(strsplit(as.character(text_output$FileName[i]),"_")[[1]][1],".pdf",sep=""),
+                                                  FileName=text_output$FileName[i],
+                                                  DateStamp=txn_line_split[[1]][1],
+                                                  TxnDescription=txn_line_split[[1]][2],
+                                                  TxnDescriptionDetail=txn_line_split[[1]][3],
+                                                  Charge=txn_line_split[[1]][4],
+                                                  ChargeCode=txn_line_split[[1]][5],
+                                                  DebitCreditAmount=NA,
+                                                  RunningBalance=txn_line_split[[1]][6],
+                                                  BalanceDetail=NA))
+      }
+      else if(!is.na(txn_line_split[[1]][2]) && length(txn_line_split[[1]]) == 5){
+        txn_detail <- rbind(txn_detail,data.frame(FileNameParent=paste(strsplit(as.character(text_output$FileName[i]),"_")[[1]][1],".pdf",sep=""),
+                                                  FileName=text_output$FileName[i],
+                                                  DateStamp=txn_line_split[[1]][1],
+                                                  TxnDescription=txn_line_split[[1]][2],
+                                                  TxnDescriptionDetail=txn_line_split[[1]][3],
+                                                  Charge=NA,
+                                                  ChargeCode=NA,
+                                                  DebitCreditAmount=txn_line_split[[1]][4],
+                                                  RunningBalance=txn_line_split[[1]][5],
+                                                  BalanceDetail=trans_lines[[1]][a+1]))
+      }
+    }
+    
+    #if(date_regex[[1]] != -1){
+      #txn_detail <- rbind(txn_detail,data.frame(Date=substr(trans_lines[[1]][a],1,attr(date_regex,"match.length")),
+    #                                            TransactionDescription=))
+    #}
+      #print(txn_temp)
+  }
+  
+  #print(date_range)
+  #print(paste(text_output$FileName[i],client_vat_reg_no,sep="|"))
+}
+
+#Only keep first page info where it is available
+first_page_info <- first_page_info[first_page_info$DateRange != "",]
+
+#Join detail and first page sets
+final <- sqldf("select       B.ChequeAccountNumber,B.DateRange,
+                             B.AccountType,B.IssuedOn,B.StatementNumber,
+                             B.ClientVatRegNumber,B.BalanceBroughtForward,
+                             B.Deposits,B.InterestEarned,B.SundryCredits,
+                             B.CashChequeAtmWithdrawals,B.SundryDebits,
+                             B.Charges,B.ChequesDepositedUnpaid,B.Balance,
+                             B.OverdraftLimit, A.*
+               from txn_detail A
+               join first_page_info B
+               on A.FileNameParent = B.FileNameParent")
+
+#Fix credit, debit designation
+# final$DebitCreditInd <- NULL
+# for(i in 1:nrow(final)){
+#   if(i > 1 && final$FileName[i] == final$FileName[i-1] && !is.na(final$BalanceDetail[i])){
+#     if(as.double(gsub(",",".",gsub(" ","",final$RunningBalance[i]))) > as.double(gsub(",",".",gsub(" ","",final$RunningBalance[i-1])))){
+#       final$DebitCreditInd[i] <- "Credit"
+#     }
+#     else{
+#       final$DebitCreditInd[i] <- "Debit"
+#     }
+#   }
+# }
+
+#cleaned_pdf_text <- rbind(cleaned_pdf_text,data.frame(FileName=text_output$FileName[i],ChequeAccountNumber=cheque_acc_num))
+
+#End time
+end.time <- Sys.time()
+time.taken <- difftime(end.time,start.time,units="mins")
+
+#Add time taken to output file
+final$TimeTakenMinutes <- time.taken
+
+#Export output to CSV
+write.table(final,file=paste(dir,"Output.txt",sep="/"),
+            row.names=F,quote=F,sep="|")
+
+
+#Stop parallel backend
+stopCluster(cl)
+
+#Clean workspace
+rm(list=ls())
+gc()
